@@ -1,0 +1,162 @@
+<!--
+  Windows 11 with the RTX A1000 (01:00.0) passed through.
+  - The libvirt hook (/etc/libvirt/hooks/qemu) moves the dGPU to vfio-pci on start and back on stop,
+    so the hostdev is managed='no'.
+  - vCPUs: 4 P-cores with HT (host CPUs 4-11, includes the 5.2 GHz cores 2 and 3);
+    emulator and disk I/O threads on E-cores 12-15. Host keeps P-cores 0-1 and all E-cores.
+  - maxphysaddr 39: the CPU reports 46 physical bits but the IOMMU only maps 39 (MGAW),
+    so guest BARs above 2^39 (ivshmem, GPU) would fail to DMA-map.
+  - Install phase: VGA + SPICE to see the installer; Looking Glass setup replaces this later.
+-->
+<domain type='kvm' xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'>
+  <name>win11</name>
+  <title>Windows 11 (RTX A1000 passthrough)</title>
+  <memory unit='GiB'>16</memory>
+  <currentMemory unit='GiB'>16</currentMemory>
+  <vcpu placement='static'>8</vcpu>
+  <iothreads>1</iothreads>
+  <cputune>
+    <vcpupin vcpu='0' cpuset='4'/>
+    <vcpupin vcpu='1' cpuset='5'/>
+    <vcpupin vcpu='2' cpuset='6'/>
+    <vcpupin vcpu='3' cpuset='7'/>
+    <vcpupin vcpu='4' cpuset='8'/>
+    <vcpupin vcpu='5' cpuset='9'/>
+    <vcpupin vcpu='6' cpuset='10'/>
+    <vcpupin vcpu='7' cpuset='11'/>
+    <emulatorpin cpuset='12-15'/>
+    <iothreadpin iothread='1' cpuset='12-15'/>
+  </cputune>
+  <os firmware='efi'>
+    <type arch='x86_64' machine='q35'>hvm</type>
+    <firmware>
+      <feature enabled='yes' name='secure-boot'/>
+      <feature enabled='no' name='enrolled-keys'/>
+    </firmware>
+    <loader secure='yes'/>
+  </os>
+  <features>
+    <acpi/>
+    <apic/>
+    <hyperv mode='custom'>
+      <relaxed state='on'/>
+      <vapic state='on'/>
+      <spinlocks state='on' retries='8191'/>
+      <vpindex state='on'/>
+      <runtime state='on'/>
+      <synic state='on'/>
+      <stimer state='on'/>
+      <reset state='on'/>
+      <vendor_id state='on' value='GenuineIntel'/>
+      <frequencies state='on'/>
+      <tlbflush state='on'/>
+      <ipi state='on'/>
+    </hyperv>
+    <kvm>
+      <hidden state='on'/>
+    </kvm>
+    <vmport state='off'/>
+    <smm state='on'/>
+    <ioapic driver='kvm'/>
+  </features>
+  <cpu mode='host-passthrough' check='none' migratable='off'>
+    <topology sockets='1' dies='1' clusters='1' cores='4' threads='2'/>
+    <cache mode='passthrough'/>
+    <maxphysaddr mode='passthrough' limit='39'/>
+  </cpu>
+  <clock offset='localtime'>
+    <timer name='rtc' tickpolicy='catchup'/>
+    <timer name='pit' tickpolicy='delay'/>
+    <timer name='hpet' present='no'/>
+    <timer name='hypervclock' present='yes'/>
+  </clock>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+  <pm>
+    <suspend-to-mem enabled='no'/>
+    <suspend-to-disk enabled='no'/>
+  </pm>
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2' cache='none' io='native' discard='unmap' iothread='1'/>
+      <source file='/var/lib/libvirt/images/win11.qcow2'/>
+      <target dev='vda' bus='virtio'/>
+      <boot order='1'/>
+    </disk>
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='/home/johannes/Downloads/Windows11_Client_x64_pt-br_26300_9457.iso'/>
+      <target dev='sda' bus='sata'/>
+      <readonly/>
+      <boot order='2'/>
+    </disk>
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='/home/johannes/Downloads/virtio-win-0.1.302.iso'/>
+      <target dev='sdb' bus='sata'/>
+      <readonly/>
+    </disk>
+
+    <!-- e1000e has an inbox Windows driver, so setup and OOBE get network without virtio-win -->
+    <interface type='network'>
+      <source network='default'/>
+      <model type='e1000e'/>
+    </interface>
+
+    <hostdev mode='subsystem' type='pci' managed='no'>
+      <source>
+        <address domain='0x0000' bus='0x01' slot='0x00' function='0x0'/>
+      </source>
+      <!-- laptop dGPU has no ROM BAR; the vBIOS lives in the GPU's own flash -->
+      <rom bar='off'/>
+      <alias name='ua-dgpu'/>
+    </hostdev>
+
+    <!-- Looking Glass frame buffer: 32 MB fits 1080p; file prepared by tmpfiles (johannes:kvm 0660) -->
+    <shmem name='looking-glass'>
+      <model type='ivshmem-plain'/>
+      <size unit='M'>32</size>
+    </shmem>
+
+    <graphics type='spice' port='5900' autoport='no'>
+      <listen type='address' address='127.0.0.1'/>
+      <image compression='off'/>
+    </graphics>
+    <video>
+      <model type='vga' vram='16384' heads='1' primary='yes'/>
+    </video>
+    <channel type='spicevmc'>
+      <target type='virtio' name='com.redhat.spice.0'/>
+    </channel>
+    <input type='tablet' bus='usb'/>
+    <input type='mouse' bus='ps2'/>
+    <input type='keyboard' bus='ps2'/>
+    <sound model='ich9'>
+      <audio id='1'/>
+    </sound>
+    <audio id='1' type='spice'/>
+    <controller type='usb' model='qemu-xhci' ports='15'/>
+    <tpm model='tpm-crb'>
+      <backend type='emulator' version='2.0'/>
+    </tpm>
+    <memballoon model='none'/>
+  </devices>
+
+  <!-- fake battery: the mobile NVIDIA driver refuses to start (Code 43) without one -->
+  <qemu:commandline>
+    <qemu:arg value='-acpitable'/>
+    <qemu:arg value='file=/var/lib/libvirt/acpi/ssdt-battery.aml'/>
+  </qemu:commandline>
+  <!-- report the HP subsystem IDs (103c:8bf2) the laptop driver package matches on -->
+  <qemu:override>
+    <qemu:device alias='ua-dgpu'>
+      <qemu:frontend>
+        <qemu:property name='x-pci-sub-vendor-id' type='unsigned' value='4156'/>
+        <qemu:property name='x-pci-sub-device-id' type='unsigned' value='35826'/>
+      </qemu:frontend>
+    </qemu:device>
+  </qemu:override>
+</domain>

@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Application
+Name=Windows 11 (VM)
+GenericName=Máquina virtual com a NVIDIA
+Comment=Liga a VM do Windows 11 com a RTX A1000 e abre no Looking Glass
+Exec=/home/johannes/.local/bin/win11-vm
+Icon=virt-manager
+Terminal=false
+Categories=System;Emulator;
+Keywords=windows;vm;virtual;looking glass;gpu;nvidia;
+StartupWMClass=looking-glass-client
+Actions=shutdown;
+
+[Desktop Action shutdown]
+Name=Desligar o Windows
+Exec=/home/johannes/.local/bin/win11-vm shutdown
+Icon=system-shutdown

@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Forward the Windows Sunshine ports from the host to the win11 VM, which sits on libvirt's
+# NAT network (virbr0) behind the laptop's Wi-Fi. Called by the libvirt hook; run as root.
+#   win11-portfwd add | del | status
+set -uo pipefail
+
+GUEST=192.168.122.144        # fixed by a DHCP reservation in libvirt's "default" network
+TCP_PORTS=49984,49989,50010  # HTTPS, HTTP, RTSP for "port = 49989" in the VM's sunshine.conf
+UDP_PORTS=49998:50002        # video, control, audio, mic
+
+RULES=(
+  "nat PREROUTING ! -i virbr0 -p tcp -m multiport --dports $TCP_PORTS -j DNAT --to-destination $GUEST"
+  "nat PREROUTING ! -i virbr0 -p udp -m multiport --dports $UDP_PORTS -j DNAT --to-destination $GUEST"
+  # libvirt rejects new connections into its NAT network; let the port-forwarded ones through
+  "filter LIBVIRT_FWI -o virbr0 -d $GUEST -m conntrack --ctstate DNAT -j ACCEPT"
+)
+
+apply() {
+  local action=$1 rule table chain spec
+  for rule in "${RULES[@]}"; do
+    read -r table chain spec <<<"$rule"
+    case $action in
+    add) iptables -t "$table" -C "$chain" $spec 2>/dev/null || iptables -t "$table" -I "$chain" 1 $spec ;;
+    del) while iptables -t "$table" -D "$chain" $spec 2>/dev/null; do :; done ;;
+    esac
+  done
+}
+
+case ${1:-status} in
+add | del) apply "$1" ;;
+status)
+  iptables -t nat -L PREROUTING -v -n | grep -E "pkts|$GUEST"
+  iptables -L LIBVIRT_FWI -v -n | grep -E "pkts|$GUEST"
+  ;;
+*)
+  echo "usage: win11-portfwd add|del|status" >&2
+  exit 2
+  ;;
+esac

@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Windows 11 VM with the NVIDIA dGPU passed through (libvirt domain "win11").
+#   win11-vm             start the VM if it is off, then open the Looking Glass window
+#   win11-vm shutdown    ask Windows to shut down; the dGPU returns to Linux afterwards
+set -uo pipefail
+
+VM=win11
+
+virsh() { LC_ALL=C command virsh -c qemu:///system "$@"; }
+notify() { notify-send -a "Windows 11 (VM)" -i virt-manager "$@"; }
+running() { [[ $(virsh domstate "$VM" 2>/dev/null | head -1) == running ]]; }
+
+case ${1:-open} in
+open) ;;
+shutdown)
+  if ! running; then
+    notify "O Windows 11 já está desligado"
+    exit 0
+  fi
+  virsh shutdown "$VM" --mode agent,acpi >/dev/null &&
+    notify "Desligando o Windows 11" "A NVIDIA volta para o Linux quando ele terminar."
+  exit
+  ;;
+*)
+  echo "usage: win11-vm [shutdown]" >&2
+  exit 2
+  ;;
+esac
+
+# match the command line: process names are cut to 15 chars, so pgrep -x never sees it
+if pgrep -u "$USER" -f '^([^ ]*/)?looking-glass-client( |$)' >/dev/null; then
+  notify "O Looking Glass já está aberto"
+  exit 0
+fi
+
+if ! running; then
+  notify "Iniciando o Windows 11" "A NVIDIA vai para a VM até ela desligar."
+  # the libvirt hook refuses to start if something still uses the dGPU and says what
+  if ! err=$(virsh start "$VM" 2>&1); then
+    kdialog --title "Windows 11 (VM)" --error "$(printf 'A VM não iniciou.\n\n%s' "$err")"
+    exit 1
+  fi
+fi
+
+exec looking-glass-client

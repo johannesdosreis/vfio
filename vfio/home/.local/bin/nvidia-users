@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# List the processes keeping the NVIDIA dGPU busy, i.e. what would stop the win11 VM from starting.
+# Uses the same check as the VM hook (/usr/local/bin/vfio-dgpu). Without sudo it sees only your
+# own processes; sudo also shows system services.
+# Exit status: 0 = nothing blocks the VM, 1 = close the listed processes first.
+set -uo pipefail
+
+dev=/sys/bus/pci/devices/0000:01:00.0
+handled='^(sunshine|nvidia-powerd|nvidia-persiste)$' # stopped and restarted by the hook itself
+
+d=$(readlink "$dev/driver") && driver=${d##*/} || driver=none
+echo "Driver da NVIDIA: $driver"
+if [[ $driver == vfio-pci ]]; then
+  echo "A GPU está com a VM agora."
+  exit 0
+fi
+
+match=(-lname '/dev/nvidia*')
+for n in "$dev"/drm/*; do
+  [[ -e $n ]] && match+=(-o -lname "/dev/dri/${n##*/}")
+done
+pids=$(find /proc/[0-9]*/fd -maxdepth 1 -type l \( "${match[@]}" \) 2>/dev/null | cut -d/ -f3 | sort -un)
+
+blocking=0
+for pid in $pids; do
+  comm=$(cat "/proc/$pid/comm" 2>/dev/null) || continue
+  line=$(printf '%7s  %-10s %s' "$pid" "$(ps -o user= -p "$pid")" "$(ps -o args= -p "$pid" | cut -c1-90)")
+  if [[ $comm =~ $handled ]]; then
+    echo "  ok      $line   (o hook fecha e reabre sozinho)"
+  else
+    echo "  FECHAR  $line"
+    blocking=1
+  fi
+done
+
+[[ -z $pids ]] && echo "Nenhum processo usando a NVIDIA."
+[[ $EUID -ne 0 ]] && echo "(sem sudo só aparecem os seus processos; serviços do sistema: sudo nvidia-users)"
+if ((blocking)); then
+  echo "Feche os processos marcados com FECHAR antes de ligar a VM."
+fi
+exit $blocking

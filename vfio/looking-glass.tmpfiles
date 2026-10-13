@@ -1,0 +1,2 @@
+# Shared memory for Looking Glass: written by QEMU (libvirt-qemu, group kvm), read by the client.
+f /dev/shm/looking-glass 0660 johannes kvm -

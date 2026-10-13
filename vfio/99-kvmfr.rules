@@ -1,0 +1,2 @@
+# /dev/kvmfr0: written by QEMU (libvirt-qemu, group kvm), read by the Looking Glass client (johannes)
+SUBSYSTEM=="kvmfr", OWNER="johannes", GROUP="kvm", MODE="0660"

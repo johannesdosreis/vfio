@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# libvirt qemu hook (/etc/libvirt/hooks/qemu): hand the dGPU to vfio-pci while a VM
+# that passes it through is running (other VMs are left alone), and forward the
+# Windows Sunshine ports to win11 while it runs.
+# libvirt runs it as: qemu <vm> <operation> <sub-operation> -, with the domain XML on stdin.
+
+vm=$1
+op=$2
+xml=$(cat)
+
+# Windows Sunshine (NVENC inside the VM) reachable from the LAN through the host
+if [[ $vm == win11 ]]; then
+  case $op in
+  started | reconnect) /usr/local/bin/win11-portfwd add ;;
+  stopped) /usr/local/bin/win11-portfwd del ;;
+  esac
+fi
+
+uses_dgpu=$(xmllint --xpath \
+  "count(//hostdev[@type='pci']/source/address[@domain='0x0000' and @bus='0x01' and @slot='0x00'])" \
+  - <<<"$xml" 2>/dev/null)
+[[ ${uses_dgpu:-0} -gt 0 ]] || exit 0
+
+case $op in
+prepare) exec /usr/local/bin/vfio-dgpu detach ;;
+release) exec /usr/local/bin/vfio-dgpu attach ;;
+esac

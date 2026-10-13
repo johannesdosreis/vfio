@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# Move the NVIDIA dGPU between the host driver and vfio-pci.
+#   vfio-dgpu detach   stop dGPU users, unload nvidia, bind vfio-pci   (before the VM starts)
+#   vfio-dgpu attach   unbind vfio-pci, reload nvidia, restart users   (after the VM stops)
+# Sunshine follows the dGPU: NVENC while it is on the host, VAAPI on the iGPU while the VM has it.
+#   vfio-dgpu status   show driver, loaded modules and processes holding the dGPU
+set -uo pipefail
+
+DGPU=0000:01:00.0
+DESKTOP_USER=johannes
+SYSTEM_UNITS=(nvidia-powerd.service nvidia-persistenced.service)
+# user units restarted whenever the dGPU changes hands, so they re-pick their encoder
+FOLLOW_UNITS=(app-dev.lizardbyte.app.Sunshine.service)
+NVIDIA_MODULES=(nvidia_drm nvidia_modeset nvidia_uvm nvidia)
+STATE=/run/vfio-dgpu # units stopped by detach, restarted by attach
+
+dev=/sys/bus/pci/devices/$DGPU
+
+log() {
+  echo "vfio-dgpu: $*"
+  logger -t vfio-dgpu -- "$*"
+}
+
+driver() {
+  local d
+  d=$(readlink "$dev/driver") && echo "${d##*/}" || echo none
+}
+
+user_systemctl() { systemctl --user -M "$DESKTOP_USER@" "$@"; }
+
+# PIDs and names of processes with an open NVIDIA device node or dGPU DRM node.
+holders() {
+  local match=(-lname '/dev/nvidia*') n pid
+  for n in "$dev"/drm/*; do
+    [[ -e $n ]] && match+=(-o -lname "/dev/dri/${n##*/}")
+  done
+  find /proc/[0-9]*/fd -maxdepth 1 -type l \( "${match[@]}" \) 2>/dev/null |
+    cut -d/ -f3 | sort -un |
+    while read -r pid; do echo "$pid $(cat "/proc/$pid/comm" 2>/dev/null)"; done
+}
+
+restart_units() {
+  local u
+  if [[ -f $STATE/system ]]; then
+    while read -r u; do systemctl start "$u"; done <"$STATE/system"
+  fi
+  if [[ -f $STATE/user ]]; then
+    while read -r u; do user_systemctl start "$u"; done <"$STATE/user"
+  fi
+  rm -rf "$STATE"
+}
+
+detach() {
+  if [[ $(driver) == vfio-pci ]]; then
+    log "dGPU already on vfio-pci"
+    return 0
+  fi
+
+  mkdir -p "$STATE"
+  : >"$STATE/system"
+  : >"$STATE/user"
+  # stop only the units whose main process actually holds the dGPU
+  local u pid busy
+  busy=$(holders | cut -d' ' -f1)
+  for u in "${SYSTEM_UNITS[@]}"; do
+    pid=$(systemctl show -p MainPID --value "$u" 2>/dev/null)
+    if [[ ${pid:-0} != 0 ]] && grep -qx "$pid" <<<"$busy"; then
+      systemctl stop "$u" && echo "$u" >>"$STATE/system"
+    fi
+  done
+  for u in "${FOLLOW_UNITS[@]}"; do
+    pid=$(user_systemctl show -p MainPID --value "$u" 2>/dev/null)
+    if [[ ${pid:-0} != 0 ]] && grep -qx "$pid" <<<"$busy"; then
+      user_systemctl stop "$u" && echo "$u" >>"$STATE/user"
+    fi
+  done
+
+  busy=$(holders)
+  if [[ -n $busy ]]; then
+    log "dGPU still in use, close these processes first:"
+    echo "$busy" | sed 's/^/  /'
+    restart_units
+    return 1
+  fi
+
+  if ! modprobe -r "${NVIDIA_MODULES[@]}"; then
+    log "could not unload the nvidia modules"
+    restart_units
+    return 1
+  fi
+
+  modprobe vfio-pci
+  echo vfio-pci >"$dev/driver_override"
+  echo "$DGPU" >/sys/bus/pci/drivers_probe
+  if [[ $(driver) != vfio-pci ]]; then
+    log "binding vfio-pci failed (driver: $(driver)), restoring nvidia"
+    attach
+    return 1
+  fi
+  log "dGPU on vfio-pci"
+
+  # followers come straight back, now without the dGPU (Sunshine falls back to VAAPI)
+  if [[ -s $STATE/user ]]; then
+    while read -r u; do user_systemctl start "$u"; done <"$STATE/user"
+    : >"$STATE/user"
+  fi
+}
+
+attach() {
+  [[ $(driver) == vfio-pci ]] && echo "$DGPU" >"$dev/driver/unbind"
+  echo >"$dev/driver_override"
+
+  # explicit list: the nvidia-utils softdep does not bring nvidia_drm back on its own
+  modprobe -a "${NVIDIA_MODULES[@]}"
+  [[ $(driver) == nvidia ]] || echo "$DGPU" >/sys/bus/pci/drivers_probe
+
+  restart_units
+  # followers re-pick the dGPU encoder (Sunshine back to NVENC)
+  local u
+  for u in "${FOLLOW_UNITS[@]}"; do
+    user_systemctl is-active -q "$u" && user_systemctl restart "$u"
+  done
+  if [[ $(driver) != nvidia ]]; then
+    log "dGPU driver is $(driver), expected nvidia"
+    return 1
+  fi
+  log "dGPU back on nvidia"
+}
+
+status() {
+  echo "driver:  $(driver)"
+  echo "modules: $(lsmod | awk '/^(nvidia|vfio)/ {print $1}' | paste -sd' ')"
+  echo "holders:"
+  holders | sed 's/^/  /'
+}
+
+if [[ $EUID -ne 0 ]]; then
+  echo "vfio-dgpu: run as root" >&2
+  exit 1
+fi
+
+case ${1:-status} in
+detach) detach ;;
+attach) attach ;;
+status) status ;;
+*)
+  echo "usage: vfio-dgpu detach|attach|status" >&2
+  exit 2
+  ;;
+esac
