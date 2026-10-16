@@ -2,7 +2,8 @@
 # Move the NVIDIA dGPU between the host driver and vfio-pci.
 #   vfio-dgpu detach   stop dGPU users, unload nvidia, bind vfio-pci   (before the VM starts)
 #   vfio-dgpu attach   unbind vfio-pci, reload nvidia, restart users   (after the VM stops)
-# Sunshine follows the dGPU: NVENC while it is on the host, VAAPI on the iGPU while the VM has it.
+# Sunshine and waywallen follow the dGPU: they use it while it is on the host and move to the
+# Intel iGPU while the VM has it (Sunshine: NVENC <-> VAAPI).
 #   vfio-dgpu status   show driver, loaded modules and processes holding the dGPU
 set -uo pipefail
 
@@ -11,6 +12,9 @@ DESKTOP_USER=johannes
 SYSTEM_UNITS=(nvidia-powerd.service nvidia-persistenced.service)
 # user units restarted whenever the dGPU changes hands, so they re-pick their encoder
 FOLLOW_UNITS=(app-dev.lizardbyte.app.Sunshine.service)
+# Flatpak followers: their processes run in the app's own scope, not in the unit that starts
+# them, so they are stopped with "flatpak kill" (app id -> unit that starts them again)
+declare -A FOLLOW_FLATPAKS=([org.waywallen.waywallen]=app-org.waywallen.waywallen@autostart.service)
 NVIDIA_MODULES=(nvidia_drm nvidia_modeset nvidia_uvm nvidia)
 STATE=/run/vfio-dgpu # units stopped by detach, restarted by attach
 
@@ -28,6 +32,28 @@ driver() {
 
 user_systemctl() { systemctl --user -M "$DESKTOP_USER@" "$@"; }
 
+# restart a follower unit; the hook's own restarts must not trip the unit's start rate limit
+follow_restart() {
+  user_systemctl reset-failed "$1" 2>/dev/null
+  user_systemctl restart "$1"
+}
+
+flatpak_user() { runuser -u "$DESKTOP_USER" -- env XDG_RUNTIME_DIR="/run/user/$(id -u "$DESKTOP_USER")" flatpak "$@"; }
+
+# PIDs of the processes in a Flatpak app's scope
+flatpak_pids() { grep -l "app-flatpak-$1-" /proc/[0-9]*/cgroup 2>/dev/null | cut -d/ -f3; }
+
+# stop a Flatpak app and wait (up to 10 s) for its processes to exit
+flatpak_stop() {
+  local i
+  flatpak_user kill "$1"
+  for i in {1..20}; do
+    [[ -z $(flatpak_pids "$1") ]] && return 0
+    sleep 0.5
+  done
+  return 1
+}
+
 # PIDs and names of processes with an open NVIDIA device node or dGPU DRM node.
 holders() {
   local match=(-lname '/dev/nvidia*') n pid
@@ -42,10 +68,11 @@ holders() {
 restart_units() {
   local u
   if [[ -f $STATE/system ]]; then
-    while read -r u; do systemctl start "$u"; done <"$STATE/system"
+    # reset-failed: repeated VM starts must not trip the unit's start rate limit
+    while read -r u; do systemctl reset-failed "$u" 2>/dev/null; systemctl start "$u"; done <"$STATE/system"
   fi
   if [[ -f $STATE/user ]]; then
-    while read -r u; do user_systemctl start "$u"; done <"$STATE/user"
+    while read -r u; do follow_restart "$u"; done <"$STATE/user"
   fi
   rm -rf "$STATE"
 }
@@ -74,6 +101,15 @@ detach() {
       user_systemctl stop "$u" && echo "$u" >>"$STATE/user"
     fi
   done
+  local app p
+  for app in "${!FOLLOW_FLATPAKS[@]}"; do
+    for p in $(flatpak_pids "$app"); do
+      if grep -qx "$p" <<<"$busy"; then
+        flatpak_stop "$app" && echo "${FOLLOW_FLATPAKS[$app]}" >>"$STATE/user"
+        break
+      fi
+    done
+  done
 
   busy=$(holders)
   if [[ -n $busy ]]; then
@@ -99,9 +135,9 @@ detach() {
   fi
   log "dGPU on vfio-pci"
 
-  # followers come straight back, now without the dGPU (Sunshine falls back to VAAPI)
+  # followers come straight back, now without the dGPU (Sunshine on VAAPI, waywallen on the iGPU)
   if [[ -s $STATE/user ]]; then
-    while read -r u; do user_systemctl start "$u"; done <"$STATE/user"
+    while read -r u; do follow_restart "$u"; done <"$STATE/user"
     : >"$STATE/user"
   fi
 }
@@ -115,10 +151,18 @@ attach() {
   [[ $(driver) == nvidia ]] || echo "$DGPU" >/sys/bus/pci/drivers_probe
 
   restart_units
-  # followers re-pick the dGPU encoder (Sunshine back to NVENC)
-  local u
+  # followers move back to the dGPU (Sunshine to NVENC, waywallen to the NVIDIA)
+  local u app
   for u in "${FOLLOW_UNITS[@]}"; do
-    user_systemctl is-active -q "$u" && user_systemctl restart "$u"
+    # also when it failed while the VM had the dGPU (it would otherwise stay down)
+    if user_systemctl is-active -q "$u" || user_systemctl is-failed -q "$u"; then
+      follow_restart "$u"
+    fi
+  done
+  for app in "${!FOLLOW_FLATPAKS[@]}"; do
+    if [[ -n $(flatpak_pids "$app") ]]; then
+      flatpak_stop "$app" && follow_restart "${FOLLOW_FLATPAKS[$app]}"
+    fi
   done
   if [[ $(driver) != nvidia ]]; then
     log "dGPU driver is $(driver), expected nvidia"

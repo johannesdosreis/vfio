@@ -6,7 +6,7 @@
 set -uo pipefail
 
 dev=/sys/bus/pci/devices/0000:01:00.0
-handled='^(sunshine|nvidia-powerd|nvidia-persiste)$' # stopped and restarted by the hook itself
+handled='^(sunshine|nvidia-powerd|nvidia-persiste|waywallen.*)$' # stopped and restarted by the hook itself
 
 d=$(readlink "$dev/driver") && driver=${d##*/} || driver=none
 echo "Driver da NVIDIA: $driver"

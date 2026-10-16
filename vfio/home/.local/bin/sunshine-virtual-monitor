@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Sunshine prep command: give each Moonlight session its own KWin output.
+#   sunshine-virtual-monitor start   create "Virtual-Monitor" (krfb-virtualmonitor) at the client's resolution
+#   sunshine-virtual-monitor stop    remove it
+# sunshine.conf has output_name = Virtual-Monitor, so the stream captures this output. krfb runs as
+# its own transient unit, so it survives the hook restarting Sunshine when the VM starts or stops.
+set -uo pipefail
+
+UNIT=krfb-virtual-monitor.service
+OUTPUT=Virtual-Monitor
+PORT=5903 # 5900 is the win11 VM's SPICE
+
+has_output() {
+  kscreen-doctor -o 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | grep -qE "^Output: [0-9]+ $OUTPUT "
+}
+
+case ${1:-} in
+start)
+  systemctl --user is-active -q "$UNIT" && exit 0
+  res=1920x1080
+  if [[ -n ${SUNSHINE_CLIENT_WIDTH:-} && -n ${SUNSHINE_CLIENT_HEIGHT:-} ]]; then
+    res=${SUNSHINE_CLIENT_WIDTH}x${SUNSHINE_CLIENT_HEIGHT}
+  fi
+  systemctl --user reset-failed "$UNIT" 2>/dev/null
+  systemd-run --user --quiet --collect --unit="$UNIT" krfb-virtualmonitor --resolution "$res" --port "$PORT"
+  # Sunshine looks for the output right after this command returns
+  for _ in {1..40}; do
+    has_output && exit 0
+    sleep 0.25
+  done
+  echo "sunshine-virtual-monitor: $OUTPUT did not appear" >&2
+  exit 1
+  ;;
+stop)
+  systemctl --user stop "$UNIT" 2>/dev/null
+  exit 0
+  ;;
+*)
+  echo "usage: sunshine-virtual-monitor start|stop" >&2
+  exit 2
+  ;;
+esac

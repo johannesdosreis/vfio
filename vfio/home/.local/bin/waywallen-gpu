@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Start the waywallen daemon on the GPU that is free right now:
+#   NVIDIA dGPU on the host (nvidia driver) -> render on it (NVIDIA GL extension in the sandbox)
+#   dGPU with the win11 VM (vfio-pci)       -> Intel iGPU; FLATPAK_GL_DRIVERS=default keeps the
+#                                              NVIDIA libraries out of the sandbox
+# The libvirt hook (vfio-dgpu) kills and restarts waywallen whenever the dGPU changes hands.
+conf=$HOME/.var/app/org.waywallen.waywallen/config/waywallen/config.toml
+
+d=$(readlink /sys/bus/pci/devices/0000:01:00.0/driver 2>/dev/null)
+if [[ ${d##*/} == nvidia ]]; then
+  node=/dev/dri/by-path/pci-0000:01:00.0-render
+else
+  node=/dev/dri/by-path/pci-0000:00:02.0-render
+  export FLATPAK_GL_DRIVERS=default
+fi
+
+# waywallen rewrites its config while running, so only touch it before it starts
+[[ -f $conf ]] && sed -i "s|^render_node = \".*\"\$|render_node = \"$node\"|" "$conf"
+
+exec flatpak run --command=waywallen org.waywallen.waywallen --no-ui

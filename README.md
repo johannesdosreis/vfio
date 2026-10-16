@@ -52,10 +52,10 @@ Particularidades do notebook que guiaram a configuração:
 Ligar (atalho "Windows 11 (VM)" ou win11-vm)
   └─ virsh start win11
       ├─ hook "prepare"  → vfio-dgpu detach
-      │    ├─ para nvidia-powerd / Sunshine, só se estiverem segurando a NVIDIA
+      │    ├─ para nvidia-powerd / Sunshine / waywallen, só se estiverem segurando a NVIDIA
       │    ├─ se outro programa estiver usando a NVIDIA: recusa e lista os processos
       │    ├─ descarrega os módulos nvidia e liga a GPU ao vfio-pci
-      │    └─ religa o Sunshine, que agora codifica na Intel (VAAPI)
+      │    └─ religa o Sunshine (agora na VAAPI da Intel) e o waywallen (agora na Intel)
       ├─ QEMU sobe com a GPU, o /dev/kvmfr0 (Looking Glass) e a bateria falsa
       └─ hook "started"  → win11-portfwd add   (portas do Sunshine do Windows)
   └─ looking-glass-client mostra o Windows numa janela do KDE
@@ -64,10 +64,16 @@ Desligar o Windows
   ├─ hook "stopped"  → win11-portfwd del
   └─ hook "release"  → vfio-dgpu attach
        ├─ tira a GPU do vfio-pci e recarrega os módulos nvidia
-       └─ religa o nvidia-powerd e reinicia o Sunshine, que volta para a NVENC
+       └─ religa o nvidia-powerd e reinicia o Sunshine (volta à NVENC) e o waywallen (volta à NVIDIA)
 ```
 
-Enquanto a VM roda, o KDE, o waywallen e o Sunshine do Linux continuam na Intel e não percebem a troca.
+O KDE fica sempre na Intel. O Sunshine e o waywallen **seguem a NVIDIA**: usam-na enquanto ela está
+no Linux e passam para a Intel enquanto a VM a tem. Em cada troca eles reiniciam, então uma
+transmissão em andamento cai por alguns segundos e o papel de parede pisca.
+
+Custo: com o waywallen na NVIDIA, ela não entra mais em economia de energia (Runtime D3). Medido:
+cerca de 8 W a mais na GPU, com mais calor e menos bateria. Para voltar a deixar o waywallen sempre
+na Intel, veja [Como desfazer](#como-desfazer).
 
 ## Uso no dia a dia
 
@@ -120,7 +126,9 @@ pareamento é digitado em `https://localhost:49990`, dentro do Windows.
 | `journalctl -t vfio-dgpu` | Log das trocas de GPU |
 | `./vfio/verify-after-reboot.sh` | Checa IOMMU, swap, ordem das GPUs e KWin depois de um reboot |
 | `sudo ./vfio/test-dynamic.sh` | Duas idas e voltas da GPU sem VM, mostrando o que o KWin tem aberto |
+| `sudo ./vfio/test-follow.sh` | Uma ida e volta com pausa, mostrando em que GPU o Sunshine e o waywallen ficaram |
 | `sudo ./vfio/diag-portfwd.sh` | Mostra se as conexões do Moonlight chegam e são repassadas |
+| `ssh win11` | Terminal no Windows (`cmd`), com a chave "Stara SSH" |
 | `./vfio/vm-ps.py 'comando'` | Roda PowerShell no Windows como SYSTEM, pelo guest agent |
 | `./vfio/vm-put.py 'C:\pasta' arquivo...` | Copia arquivos do Linux para o Windows, pelo guest agent |
 
@@ -155,9 +163,15 @@ a VM está ligada. Assim CUDA, NVENC e `prime-run` continuam disponíveis no Lin
   - **`detach`:** para os serviços que estão segurando a NVIDIA (`nvidia-powerd`,
     `nvidia-persistenced`, Sunshine). Recusa, listando os processos, se sobrar qualquer outro.
     Descarrega `nvidia_drm`, `nvidia_modeset`, `nvidia_uvm` e `nvidia` e liga a GPU ao `vfio-pci`
-    via `driver_override`. No fim, religa o Sunshine (agora na Intel).
+    via `driver_override`. No fim, religa o Sunshine e o waywallen, que sobem na Intel.
   - **`attach`:** desfaz a troca, carrega os quatro módulos nvidia **explicitamente** e religa os
-    serviços. Também reinicia o Sunshine, para ele voltar à NVENC.
+    serviços. Também reinicia o Sunshine e o waywallen, para eles voltarem à NVIDIA.
+  - **Seguidores:** `FOLLOW_UNITS` (Sunshine) são serviços normais. `FOLLOW_FLATPAKS` (waywallen)
+    rodam num escopo próprio do Flatpak, fora do serviço que os inicia: o hook os identifica pelo
+    cgroup e os fecha com `flatpak kill`.
+  - **Limite de inícios:** antes de cada reinício que ele mesmo provoca, o hook roda
+    `systemctl reset-failed`. O Sunshine aceita só 5 inícios a cada 8 min 20 s, e ligar e desligar
+    a VM algumas vezes seguidas estourava esse limite (o mesmo valia para o `nvidia-powerd`).
   - **`status`:** driver atual, módulos carregados e processos com a GPU aberta.
 - **`/etc/libvirt/hooks/qemu`** (fonte: `vfio/libvirt-qemu-hook`): chama `vfio-dgpu detach` em
   `prepare` e `attach` em `release`, só para VMs com um `<hostdev>` apontando para `01:00.0`. Para a
@@ -190,9 +204,15 @@ Se qualquer programa ficar com a NVIDIA aberta, a VM não liga. Quatro ajustes c
      (o waywallen e o plugin de papel de parede dele, dentro do `plasmashell`) pegavam a NVIDIA nos
      boots em que ela ficava com o `renderD128`.
    - É uma regra `install`, e não `softdep`, pelo mesmo motivo do item anterior.
-3. **waywallen** (papel de parede animado, Flatpak): `render_node` dos plugins de vídeo e imagem em
-   `~/.var/app/org.waywallen.waywallen/config/waywallen/config.toml` aponta para
-   `/dev/dri/by-path/pci-0000:00:02.0-render`. Backup no mesmo lugar, com `.bak-20261013`.
+3. **waywallen** (papel de parede animado, Flatpak) segue a GPU:
+   - o drop-in `~/.config/systemd/user/app-org.waywallen.waywallen@autostart.service.d/gpu.conf`
+     faz o autostart rodar `~/.local/bin/waywallen-gpu`;
+   - antes de iniciar, o `waywallen-gpu` aponta o `render_node` dos plugins de vídeo e imagem
+     (`~/.var/app/org.waywallen.waywallen/config/waywallen/config.toml`) para a NVIDIA, se ela estiver
+     no Linux, ou para a Intel, com `FLATPAK_GL_DRIVERS=default`, se estiver na VM. Essa variável
+     deixa as bibliotecas da NVIDIA fora da sandbox: a extensão `GL.nvidia` do Flatpak faz o
+     renderizador abrir a NVIDIA mesmo com o `render_node` na Intel;
+   - backup da configuração original: `config.toml.bak-20261013`.
 4. **Janela do Looking Glass sem piscar.**
    - O Krohnkite reorganizava a janela quando o foco mudava. A classe `looking-glass-client` entrou
      no `ignoreClass` do Krohnkite, em `~/.config/kwinrc` (backup `~/.config/kwinrc.bak-20261013`).
@@ -272,12 +292,27 @@ monitor virtual no Windows.
   troca o `ExecStart` por `~/.local/bin/sunshine-gpu`.
 - **`sunshine-gpu`** olha onde a NVIDIA está quando o Sunshine inicia:
   - **com o driver nvidia:** o Sunshine escolhe sozinho (NVENC);
-  - **com o vfio-pci:** força `encoder=vaapi`. Sem a NVIDIA, a escolha automática trava dentro do
-    `libcuda` e entra em loop.
-- **`~/.config/sunshine/sunshine.conf`:** `adapter_name = /dev/dri/renderD128` (a Intel). Backup em
+  - **com o vfio-pci:** força `encoder=vaapi` e `adapter_name` na Intel
+    (`/dev/dri/by-path/pci-0000:00:02.0-render`), pela linha de comando. Sem a NVIDIA, a escolha
+    automática trava dentro do `libcuda` e entra em loop. E o `adapter_name` do arquivo pode estar
+    na NVIDIA, que nesse momento não existe.
+- **`~/.config/sunshine/sunshine.conf`:** a placa (`adapter_name`) é a que estiver escolhida na
+  interface web do Sunshine. Hoje é `/dev/dri/renderD129`, a NVIDIA. Backup em
   `sunshine.conf.bak-20261013`.
 - **O hook reinicia o Sunshine em cada troca** de GPU (`FOLLOW_UNITS` no `vfio-dgpu`). Uma
   transmissão em andamento cai por alguns segundos.
+- **Monitor virtual automático:** o Sunshine captura a tela `Virtual-Monitor`
+  (`output_name`), e o `global_prep_cmd` do `sunshine.conf` cria e remove essa tela sozinho:
+  - quando uma sessão do Moonlight começa, roda `~/.local/bin/sunshine-virtual-monitor start`, que
+    sobe o `krfb-virtualmonitor` como serviço próprio (`krfb-virtual-monitor.service`, via
+    `systemd-run`) na resolução pedida pelo aparelho (`SUNSHINE_CLIENT_WIDTH`/`HEIGHT`), com o VNC na
+    porta 5903 (a 5900 é do SPICE da VM), e espera o KWin criar a tela;
+  - quando a sessão termina, roda `sunshine-virtual-monitor stop`. A sessão só termina quando o app
+    é **encerrado**: Ctrl+Alt+Shift+**E** no Moonlight do PC, ou "encerrar" no menu do "Desktop" na
+    lista de apps. Ctrl+Alt+Shift+**Q** só desconecta: a sessão e o monitor virtual continuam, e
+    reconectar reaproveita os dois;
+  - fora de uma sessão, o Sunshine sobe normalmente sem essa tela e usa uma tela física só para
+    testar os codificadores.
 
 **Windows:** porta base 49989.
 
@@ -291,7 +326,35 @@ monitor virtual no Windows.
 - O backend de firewall do libvirt é `iptables`. As cadeias do libvirt vêm antes das do ufw, então o
   ufw (ativo, "deny incoming") não interfere.
 
-### 8. Pacotes
+### 8. SSH para o Windows
+
+- **Windows:** o servidor OpenSSH já vem neste build. O serviço `sshd` foi ligado com início
+  automático, e a regra "OpenSSH SSH Server (sshd)" do firewall vale para o perfil Privado.
+- **Chave:** a pública "Stara SSH" (ed25519) foi autorizada em
+  `C:\ProgramData\ssh\administrators_authorized_keys`, o arquivo usado porque `johannes` é
+  administrador. O OpenSSH do Windows exige que só Administradores e SISTEMA tenham acesso a ele.
+- **Linux:** atalho `win11` no fim do `~/.ssh/config` (backup `~/.ssh/config.bak-20261013`). Ele
+  oferece só a chave "Stara SSH" (`IdentitiesOnly yes`), que vem do agente do 1Password. Com várias
+  chaves no agente, o Windows desistiria antes de chegar à certa.
+- **Uso:** `ssh win11`. O shell padrão é o `cmd`. Só funciona a partir do notebook; a porta 22 não é
+  repassada para a rede.
+
+### 9. Deskflow (teclado e mouse do Linux no Windows)
+
+- **Linux (servidor, já usado antes com `NMTENGPROD6301-win11` à esquerda):** a VM `VM23711` entrou
+  na célula à direita do notebook, no `~/.config/Deskflow/Deskflow.conf` (`screens\9\name` e uma
+  seção `[computer_VM23711]`). Backups: `Deskflow.conf.bak-20261013` e
+  `deskflow-server.conf.bak-20261013`.
+- **Borda:** no KDE, o notebook fica à direita do Dell. O Deskflow só troca nas bordas externas do
+  desktop, então o mouse vai para o Windows pela **borda direita da tela do notebook**.
+- **ufw:** `24800/tcp on virbr0 ALLOW 192.168.122.144`. A regra `24800 ALLOW Anywhere`, que já
+  existia, também cobriria a VM.
+- **Windows (cliente):** Deskflow 1.27.0 (MSI sem assinatura digital; o SHA-256 confere com o
+  publicado no GitHub), serviço `Deskflow` automático. Ele conecta em `192.168.122.1` com o nome
+  `VM23711`. A primeira configuração e o aceite das impressões digitais TLS dos dois lados são
+  feitos na interface.
+
+### 10. Pacotes
 
 | Pacote | Origem | Para quê |
 |---|---|---|
@@ -334,9 +397,13 @@ Os arquivos inteiros têm cópia em `vfio/home/`, no mesmo caminho relativo à p
 | `~/.local/bin/win11-vm` + `~/.local/share/applications/win11-vm.desktop` | Atalho "Windows 11 (VM)" | `vfio/home/…` |
 | `~/.local/bin/nvidia-users` | Quem está usando a NVIDIA | `vfio/home/…` |
 | `~/.local/bin/sunshine-gpu` + `~/.config/systemd/user/app-dev.lizardbyte.app.Sunshine.service.d/gpu-encoder.conf` | Sunshine escolhe NVENC ou VAAPI | `vfio/home/…` |
-| `~/.config/sunshine/sunshine.conf` | Captura do Sunshine e `adapter_name` da Intel | `vfio/home/…` |
+| `~/.config/sunshine/sunshine.conf` | Captura, placa e `global_prep_cmd` do Sunshine | `vfio/home/…` |
+| `~/.local/bin/sunshine-virtual-monitor` | Cria e remove o monitor virtual a cada sessão do Moonlight | `vfio/home/…` |
+| `~/.local/bin/waywallen-gpu` + `~/.config/systemd/user/app-org.waywallen.waywallen@autostart.service.d/gpu.conf` | waywallen segue a GPU | `vfio/home/…` |
 | `~/.config/kwinrc`, só a chave `[Script-krohnkite] ignoreClass` | Krohnkite ignora o Looking Glass | comando abaixo |
-| `~/.var/app/org.waywallen.waywallen/config/waywallen/config.toml`, só os dois `render_node` | waywallen na Intel | comando abaixo |
+| `~/.var/app/org.waywallen.waywallen/config/waywallen/config.toml`, só os dois `render_node` | GPU do waywallen | escrito pelo `waywallen-gpu` a cada início |
+| `~/.ssh/config`, só o bloco `Host win11` | Atalho `ssh win11` | veja a seção [SSH](#8-ssh-para-o-windows) |
+| `~/.config/Deskflow/Deskflow.conf`, só `screens\9\name=VM23711` + `[computer_VM23711]` | VM à direita no Deskflow | refazer arrastando a tela na interface do Deskflow |
 
 ### Restaurar os arquivos de usuário
 
@@ -346,8 +413,8 @@ Numa instalação nova, ou se algum desses arquivos se perder, rode a partir da 
 cp -a vfio/home/. ~/ && systemctl --user daemon-reload && kbuildsycoca6
 ```
 
-O `kwinrc` e o `config.toml` do waywallen guardam muitas outras configurações, então só a linha
-relevante de cada um é reaplicada. A lista do Krohnkite abaixo é o padrão dele mais
+O `kwinrc` guarda muitas outras configurações, então só a chave do Krohnkite é reaplicada. O
+`render_node` do waywallen não precisa de nada: o `waywallen-gpu` o reescreve a cada início. A lista do Krohnkite abaixo é o padrão dele mais
 `looking-glass-client`. Depois, desligue e ligue o script do Krohnkite em
 Configurações → Gerenciador de janelas → Scripts do KWin.
 
@@ -355,11 +422,6 @@ Configurações → Gerenciador de janelas → Scripts do KWin.
 kwriteconfig6 --file kwinrc --group Script-krohnkite --key ignoreClass "krunner,yakuake,spectacle,kded5,xwaylandvideobridge,plasmashell,ksplashqml,org.kde.plasmashell,org.kde.polkit-kde-authentication-agent-1,org.kde.kruler,kruler,kwin_wayland,ksmserver-logout-greeter,looking-glass-client"
 ```
 
-Para o waywallen, feche-o antes, senão ele sobrescreve o arquivo ao sair:
-
-```bash
-flatpak kill org.waywallen.waywallen; sed -i 's|^render_node = ""$|render_node = "/dev/dri/by-path/pci-0000:00:02.0-render"|' ~/.var/app/org.waywallen.waywallen/config/waywallen/config.toml
-```
 
 ## Arquivos deste repositório
 
@@ -368,12 +430,12 @@ flatpak kill org.waywallen.waywallen; sed -i 's|^render_node = ""$|render_node =
 | `home/` | Cópia dos arquivos de usuário, nos mesmos caminhos de `~` (ver [Restaurar os arquivos de usuário](#restaurar-os-arquivos-de-usuário)) |
 | `vfio-dgpu`, `libvirt-qemu-hook`, `win11-portfwd` | Fonte dos scripts instalados |
 | `*.conf`, `*.rules`, `limine.new`, `ssdt-battery.asl` | Fonte das configurações instaladas (`90-kwin-igpu.conf` é igual ao de `home/`) |
-| `apply-limine.sh`, `install-dynamic.sh`, `install-igpu-first.sh`, `install-kvmfr-config.sh`, `install-portfwd.sh`, `setup-vm.sh` | Instaladores (rodar com sudo) |
+| `apply-limine.sh`, `install-dynamic.sh`, `install-igpu-first.sh`, `install-kvmfr-config.sh`, `install-portfwd.sh`, `install-sunshine-libva-fix.sh`, `setup-vm.sh` | Instaladores (rodar com sudo) |
 | `apply-lg-config.py`, `apply-kvmfr.py` | Ajustes na VM (modo de teste por padrão; `--apply` com a VM desligada) |
 | `win11-current.xml` | Definição atual da VM (backup/referência) |
 | `win11.xml` | Definição da fase de instalação (com VGA, ISOs, e1000e) |
 | `vm-ps.py`, `vm-put.py` | Comandos e arquivos no Windows via guest agent |
-| `verify-after-reboot.sh`, `test-dynamic.sh`, `diag-portfwd.sh` | Diagnóstico |
+| `verify-after-reboot.sh`, `test-dynamic.sh`, `test-follow.sh`, `diag-portfwd.sh` | Diagnóstico |
 | `dump-vbios.sh`, `check-vbios.py`, `acpi/` | Investigação do vBIOS. `acpi/` tem o DSDT e os SSDTs do notebook, sem a MSDM (que guarda a chave do Windows) |
 | `limine.diff` | Registro da mudança no `/etc/default/limine` |
 | `looking-glass.tmpfiles` | **Obsoleto:** regra do `/dev/shm`, substituída pelo kvmfr |
@@ -407,6 +469,22 @@ Krohnkite (um update do script pode resetar a configuração) e se `doubleBuffer
 `systemctl --user cat app-dev.lizardbyte.app.Sunshine.service` deve mostrar
 `ExecStart=%h/.local/bin/sunshine-gpu`.
 
+**O Sunshine trava em loop com a VM ligada ("Couldn't initialize va display").** O pacote
+`sunshine` 2026.1015 do CachyOS traz a `libva` embutida, procurando os drivers em
+`/home/runner/work/build-deps/build-deps/build/libva/lib/dri`. Como o binário tem *capabilities*,
+a `libva` ignora `LIBVA_DRIVERS_PATH`. Sem VAAPI, o Sunshine tenta o codificador Vulkan e trava no
+`libvulkan_intel`. O contorno, `vfio/install-sunshine-libva-fix.sh`, cria esse caminho como link para
+`/usr/lib/dri`. Quando o pacote for corrigido, apague `/home/runner`. Desde essa versão, o hook
+também religa o Sunshine se ele estiver "failed" quando a VM desliga.
+
+**Um serviço não volta depois de uma troca ("start-limit-hit").** O hook já zera o limite antes
+dos reinícios dele. Se acontecer por outro motivo, rode
+`systemctl --user reset-failed app-dev.lizardbyte.app.Sunshine.service` (ou
+`sudo systemctl reset-failed nvidia-powerd.service`) e inicie de novo.
+
+**O papel de parede some ou para.** `systemctl --user status app-org.waywallen.waywallen@autostart.service`
+e `sudo ./vfio/test-follow.sh` mostram em que GPU o renderizador está.
+
 **O Moonlight não conecta no `win11`:**
 - a VM está ligada?
 - use o IP da rede em que o aparelho do Moonlight está;
@@ -432,6 +510,13 @@ Do mais simples para o mais profundo. Os comandos de sistema precisam de sudo.
 - **Sunshine do Linux:**
   - apague o drop-in `gpu-encoder.conf` e rode `systemctl --user daemon-reload`;
   - restaure `~/.config/sunshine/sunshine.conf.bak-20261013`.
+- **waywallen sempre na Intel** (sem seguir a GPU, para a NVIDIA poder dormir):
+  - em `~/.local/bin/waywallen-gpu`, deixe só o ramo da Intel (`render_node` na Intel e
+    `FLATPAK_GL_DRIVERS=default`), e reinicie o waywallen. O hook continua funcionando: como ele não
+    segura mais a NVIDIA, não é fechado nas trocas;
+  - para tirar o lançador de vez: apague o drop-in `gpu.conf` do autostart do waywallen e rode
+    `systemctl --user daemon-reload`. Nesse caso, a extensão `GL.nvidia` do Flatpak volta a fazer o
+    waywallen abrir a NVIDIA.
 - **Krohnkite:** restaure `~/.config/kwinrc.bak-20261013`.
 - **kvmfr:**
   - volte a VM para `<shmem>` (o oposto do `apply-kvmfr.py`) e o `client.ini` para

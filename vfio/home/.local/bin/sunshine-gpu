@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Start Sunshine with the encoder that fits where the NVIDIA dGPU is right now:
 #   on the host (nvidia driver)    -> Sunshine picks NVENC itself
-#   with the win11 VM (vfio-pci)   -> force VAAPI on the Intel iGPU (adapter_name in sunshine.conf);
-#                                     auto-probing without the dGPU crashes inside libcuda
+#   with the win11 VM (vfio-pci)   -> force VAAPI on the Intel iGPU; auto-probing without the dGPU
+#                                     crashes inside libcuda, and adapter_name from sunshine.conf
+#                                     (set in Sunshine's web UI) may point at the absent NVIDIA
 # The libvirt hook (vfio-dgpu) restarts Sunshine whenever the dGPU changes hands.
 d=$(readlink /sys/bus/pci/devices/0000:01:00.0/driver 2>/dev/null)
 if [[ ${d##*/} == nvidia ]]; then
   exec /usr/bin/sunshine "$@"
 fi
-exec /usr/bin/sunshine "$@" encoder=vaapi
+exec /usr/bin/sunshine "$@" encoder=vaapi adapter_name=/dev/dri/by-path/pci-0000:00:02.0-render
