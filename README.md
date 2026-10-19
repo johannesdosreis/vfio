@@ -443,9 +443,10 @@ kwriteconfig6 --file kwinrc --group Script-krohnkite --key ignoreClass "krunner,
 
 ## Solução de problemas
 
-**A VM não liga ("dGPU still in use").** Algum programa está com a NVIDIA aberta. Rode
-`nvidia-users`, feche o que aparecer como `FECHAR` e tente de novo. O histórico fica em
-`journalctl -t vfio-dgpu`.
+**A VM não liga ("dGPU still in use").** Algum programa está com a NVIDIA aberta. A janela de
+erro do `win11-vm` mostra a saída do `nvidia-users`: feche o que aparecer como `FECHAR` e tente de
+novo. Apps Electron/Chromium também abrem a NVIDIA sozinhos: o app do ChatGPT/Codex, por exemplo,
+abre com o processo `on_device_model`. O histórico fica em `journalctl -t vfio-dgpu`.
 
 **Depois de um reboot, o desktop não aparece.** Pode ser o `KWIN_DRM_DEVICES` apontando para um
 `/dev/dri/igpu` que não existe. Aperte Ctrl+Alt+F3, entre no terminal, rode o comando abaixo e

@@ -20,8 +20,9 @@ STATE=/run/vfio-dgpu # units stopped by detach, restarted by attach
 
 dev=/sys/bus/pci/devices/$DGPU
 
+# stderr: libvirt appends a failed hook's stderr (not its stdout) to the error it reports
 log() {
-  echo "vfio-dgpu: $*"
+  echo "vfio-dgpu: $*" >&2
   logger -t vfio-dgpu -- "$*"
 }
 
@@ -114,7 +115,7 @@ detach() {
   busy=$(holders)
   if [[ -n $busy ]]; then
     log "dGPU still in use, close these processes first:"
-    echo "$busy" | sed 's/^/  /'
+    echo "$busy" | sed 's/^/  /' >&2
     restart_units
     return 1
   fi

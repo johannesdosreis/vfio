@@ -35,8 +35,10 @@ fi
 
 if ! running; then
   notify "Iniciando o Windows 11" "A NVIDIA vai para a VM até ela desligar."
-  # the libvirt hook refuses to start if something still uses the dGPU and says what
+  # the libvirt hook refuses to start if something still uses the dGPU, but libvirt only
+  # reports "exit status 1", so name the processes holding it here
   if ! err=$(virsh start "$VM" 2>&1); then
+    users=$("${0%/*}/nvidia-users" 2>&1) || err=$users
     kdialog --title "Windows 11 (VM)" --error "$(printf 'A VM não iniciou.\n\n%s' "$err")"
     exit 1
   fi
