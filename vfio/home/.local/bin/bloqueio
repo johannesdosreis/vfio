@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# Bloqueia e desbloqueia a tela da VM win11 pelo ssh (atalho `windows`).
+#   bloqueio on  (ou b, bloquear)      bloqueia (tarefa LockNow)
+#   bloqueio off (ou d, desbloquear)   desbloqueia digitando a senha (tarefa UnlockNow)
+#   bloqueio                           diz se está bloqueada
+#   bloqueio instalar                  compila o helper e cria ou recria as duas tarefas no Windows
+#   bloqueio seguir                    fica ouvindo a tela do KDE: o Windows bloqueia e desbloqueia
+#                                      junto com o host (serviço de usuário bloqueio-seguir.service)
+# O Win+L vindo do Deskflow não funciona: o Winlogon ignora teclas injetadas por software.
+# LockNow roda na sessão do johannes (o LockWorkStation só vale dentro da própria sessão).
+# UnlockNow roda C:\ProgramData\bloqueio\bloqueio-helper.exe como SYSTEM: ele digita na tela de
+# bloqueio a senha do auto login (segredo LSA DefaultPassword). Fonte em
+# ~/.local/share/bloqueio/bloqueio-helper.cs. Não usa tsdiscon/tscon: trocar a sessão do console
+# faz o SunshineService reiniciar o sunshine.exe, e o Moonlight da terceira tela cai.
+# Se a sessão não estiver bloqueada, o off não faz nada.
+# No seguir, o desbloqueio do host só desbloqueia o Windows se foi o bloqueio do host que o
+# bloqueou: um Windows bloqueado antes (bloqueio on, ou à mão) continua bloqueado.
+# A saída vai toda para o stdout, em uma linha: os scripts do Vicinae mostram a primeira linha no HUD.
+set -uo pipefail
+
+fonte=$HOME/.local/share/bloqueio/bloqueio-helper.cs
+win() { ssh -o BatchMode=yes -o ConnectTimeout=5 windows "$@" 2>/dev/null; }
+
+# -EncodedCommand (UTF-16LE em base64) evita brigar com as aspas do cmd, o shell do ssh.
+winps() { win powershell -NoProfile -NonInteractive -EncodedCommand "$(iconv -t UTF-16LE <<<"$1" | base64 -w0)"; }
+
+# 0 = bloqueada, 1 = desbloqueada, 255 = VM inacessível.
+# O LogonUI só existe enquanto a tela de bloqueio (ou de login) está aberta.
+bloqueada() {
+  local saida
+  # Aspas dentro das aspas simples: o ssh junta os argumentos e o cmd do Windows precisa delas.
+  saida=$(win 'tasklist /fi "imagename eq LogonUI.exe" /fo csv /nh') || return 255
+  [[ $saida == *LogonUI* ]]
+}
+
+rodar() {
+  if ! win schtasks /Run /TN "$1" >/dev/null; then
+    echo "Falha ao rodar a tarefa $1 no Windows (VM desligada? rode: bloqueio instalar)"
+    exit 1
+  fi
+}
+
+# Espera a tela chegar no estado pedido (0 = bloqueada, 1 = desbloqueada).
+esperar() {
+  local i
+  for i in {1..15}; do
+    bloqueada
+    [[ $? == "$1" ]] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+instalar() {
+  [[ -r $fonte ]] || { echo "Fonte do helper não encontrada: $fonte"; exit 1; }
+
+  # A pasta só aceita escrita de SYSTEM e Administradores: a tarefa roda o exe dela como SYSTEM.
+  winps '
+$d = "C:\ProgramData\bloqueio"
+New-Item -ItemType Directory -Force $d | Out-Null
+icacls $d /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" | Out-Null
+exit $LASTEXITCODE
+' || { echo "Falha ao criar C:\\ProgramData\\bloqueio no Windows"; exit 1; }
+
+  scp -q -o BatchMode=yes -o ConnectTimeout=5 "$fonte" windows:C:/ProgramData/bloqueio/bloqueio-helper.cs 2>/dev/null ||
+    { echo "Falha ao copiar o helper para o Windows"; exit 1; }
+
+  local saida
+  saida=$(winps '
+$ErrorActionPreference = "Stop"
+$d = "C:\ProgramData\bloqueio"
+$out = & "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /optimize /platform:x64 "/out:$d\bloqueio-helper.exe" "$d\bloqueio-helper.cs" 2>&1
+if ($LASTEXITCODE) { "csc: " + ($out -join " "); exit 1 }
+$s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 1)
+$a = New-ScheduledTaskAction -Execute "rundll32.exe" -Argument "user32.dll,LockWorkStation"
+$p = New-ScheduledTaskPrincipal -UserId "johannes" -LogonType Interactive -RunLevel Limited
+Register-ScheduledTask -TaskName "LockNow" -Action $a -Principal $p -Settings $s -Force | Out-Null
+$a = New-ScheduledTaskAction -Execute "$d\bloqueio-helper.exe" -Argument "unlock"
+$p = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+Register-ScheduledTask -TaskName "UnlockNow" -Action $a -Principal $p -Settings $s -Force | Out-Null
+')
+  if [[ $? == 0 ]]; then
+    echo "Helper compilado e tarefas LockNow e UnlockNow criadas no Windows"
+  else
+    echo "Falha ao instalar no Windows: ${saida:-sem resposta}"
+    exit 1
+  fi
+}
+
+vm_ligada() { virsh -q -c qemu:///system list --name 2>/dev/null | grep -qx win11; }
+
+# O kscreenlocker emite ActiveChanged(true) ao bloquear e ActiveChanged(false) ao desbloquear.
+# Com --dest, o gdbus só aceita o sinal vindo do dono do nome org.freedesktop.ScreenSaver.
+seguir() {
+  local eu=${BASH_SOURCE[0]}
+  # Marca de que fui eu que bloqueei o Windows. Fica no /run/user: some num reboot.
+  local marca=${XDG_RUNTIME_DIR:-/run/user/$UID}/bloqueio-seguir
+  local r
+  echo "Seguindo o bloqueio da tela do KDE"
+  # A saída do on/off passa pelo echo deste loop: linhas de um processo que já terminou chegam ao
+  # journal sem a unit, e o `journalctl --user -u bloqueio-seguir` não as mostraria.
+  stdbuf -oL gdbus monitor --session --dest org.freedesktop.ScreenSaver --object-path /org/freedesktop/ScreenSaver |
+    while read -r linha; do
+      case $linha in
+      *ActiveChanged*'(true,)'*)
+        rm -f "$marca"
+        if ! vm_ligada; then
+          echo "Host bloqueado; VM desligada"
+          continue
+        fi
+        bloqueada
+        case $? in
+        0) echo "Host bloqueado; Windows já estava bloqueado, fica assim no desbloqueio" ;;
+        1)
+          r=$("$eu" on) && touch "$marca"
+          echo "Host bloqueado; $r"
+          ;;
+        *) echo "Host bloqueado; VM inacessível" ;;
+        esac
+        ;;
+      *ActiveChanged*'(false,)'*)
+        if [[ ! -e $marca ]]; then
+          echo "Host desbloqueado; o Windows não foi bloqueado junto, nada a fazer"
+          continue
+        fi
+        rm -f "$marca"
+        if vm_ligada; then r=$("$eu" off); else r="VM desligada"; fi
+        echo "Host desbloqueado; $r"
+        ;;
+      esac
+    done
+  echo "gdbus monitor terminou"
+  exit 1
+}
+
+case ${1:-status} in
+b | on | bloquear | lock)
+  rodar LockNow
+  if esperar 0; then echo "Windows bloqueado"; else echo "Windows não bloqueou"; exit 1; fi
+  ;;
+d | off | desbloquear | unlock)
+  bloqueada
+  case $? in
+  1) echo "Windows já está desbloqueado" && exit 0 ;;
+  255) echo "VM inacessível" && exit 1 ;;
+  esac
+  rodar UnlockNow
+  if esperar 1; then echo "Windows desbloqueado"; else echo "Windows continua bloqueado"; exit 1; fi
+  ;;
+instalar | install) instalar ;;
+seguir | follow) seguir ;;
+status)
+  bloqueada
+  case $? in
+  0) echo "Windows bloqueado" ;;
+  1) echo "Windows desbloqueado" ;;
+  *) echo "VM inacessível" && exit 1 ;;
+  esac
+  ;;
+*)
+  echo "uso: bloqueio [on|off|instalar|seguir]" >&2
+  exit 2
+  ;;
+esac

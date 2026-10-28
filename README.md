@@ -52,10 +52,10 @@ Particularidades do notebook que guiaram a configuração:
 Ligar (atalho "Windows 11 (VM)" ou win11-vm)
   └─ virsh start win11
       ├─ hook "prepare"  → vfio-dgpu detach
-      │    ├─ para nvidia-powerd / Sunshine / waywallen, só se estiverem segurando a NVIDIA
+      │    ├─ para nvidia-powerd / Sunshine / waywallen / Hermes Gateway, só se estiverem segurando a NVIDIA
       │    ├─ se outro programa estiver usando a NVIDIA: recusa e lista os processos
       │    ├─ descarrega os módulos nvidia e liga a GPU ao vfio-pci
-      │    └─ religa o Sunshine (agora na VAAPI da Intel) e o waywallen (agora na Intel)
+      │    └─ religa Sunshine (VAAPI), waywallen (Intel) e Hermes Gateway (sem CUDA)
       ├─ QEMU sobe com a GPU, o /dev/kvmfr0 (Looking Glass) e a bateria falsa
       └─ hook "started"  → win11-portfwd add   (portas do Sunshine do Windows)
   └─ looking-glass-client mostra o Windows numa janela do KDE
@@ -64,12 +64,17 @@ Desligar o Windows
   ├─ hook "stopped"  → win11-portfwd del
   └─ hook "release"  → vfio-dgpu attach
        ├─ tira a GPU do vfio-pci e recarrega os módulos nvidia
-       └─ religa o nvidia-powerd e reinicia o Sunshine (volta à NVENC) e o waywallen (volta à NVIDIA)
+       └─ religa nvidia-powerd e reinicia Sunshine (NVENC), waywallen (NVIDIA) e Hermes Gateway (CUDA disponível)
 ```
 
 O KDE fica sempre na Intel. O Sunshine e o waywallen **seguem a NVIDIA**: usam-na enquanto ela está
 no Linux e passam para a Intel enquanto a VM a tem. Em cada troca eles reiniciam, então uma
 transmissão em andamento cai por alguns segundos e o papel de parede pisca.
+
+O `hermes-gateway.service` também entra nessa troca: se estiver usando a NVIDIA, é parado antes
+do passthrough e reaberto sem CUDA; quando a GPU volta, reinicia se estiver ativo ou em falha para
+detectar a NVIDIA de novo. Um gateway parado manualmente não é iniciado. O reinício pode
+interromper tarefas em andamento e desconecta temporariamente as integrações do Hermes.
 
 Custo: com o waywallen na NVIDIA, ela não entra mais em economia de energia (Runtime D3). Medido:
 cerca de 8 W a mais na GPU, com mais calor e menos bateria. Para voltar a deixar o waywallen sempre
@@ -119,6 +124,8 @@ pareamento é digitado em `https://localhost:49990`, dentro do Windows.
 | Comando | Para quê |
 |---|---|
 | `win11-vm` / `win11-vm shutdown` | Ligar e abrir o Looking Glass / desligar o Windows |
+| `bloqueio on` / `bloqueio off` / `bloqueio` | Bloquear / desbloquear (digita a senha sozinho) a tela do Windows / ver se está bloqueada |
+| `journalctl --user -u bloqueio-seguir` | O que o Windows fez quando a tela do KDE bloqueou ou desbloqueou |
 | `nvidia-users` | O que está usando a NVIDIA (código de saída 1 = algo bloqueia a VM) |
 | `sudo vfio-dgpu status` | Driver atual da NVIDIA, módulos carregados, processos com a GPU aberta |
 | `sudo vfio-dgpu detach` / `attach` | Trocar a GPU manualmente entre Linux e vfio-pci, sem VM |
@@ -161,14 +168,18 @@ a VM está ligada. Assim CUDA, NVENC e `prime-run` continuam disponíveis no Lin
 
 - **`/usr/local/bin/vfio-dgpu`** (fonte: `vfio/vfio-dgpu`):
   - **`detach`:** para os serviços que estão segurando a NVIDIA (`nvidia-powerd`,
-    `nvidia-persistenced`, Sunshine). Recusa, listando os processos, se sobrar qualquer outro.
+    `nvidia-persistenced`, Sunshine, waywallen e Hermes Gateway). Recusa, listando os processos,
+    se sobrar qualquer outro.
     Descarrega `nvidia_drm`, `nvidia_modeset`, `nvidia_uvm` e `nvidia` e liga a GPU ao `vfio-pci`
-    via `driver_override`. No fim, religa o Sunshine e o waywallen, que sobem na Intel.
+    via `driver_override`. No fim, religa Sunshine e waywallen na Intel, e o Hermes Gateway sem CUDA.
   - **`attach`:** desfaz a troca, carrega os quatro módulos nvidia **explicitamente** e religa os
-    serviços. Também reinicia o Sunshine e o waywallen, para eles voltarem à NVIDIA.
-  - **Seguidores:** `FOLLOW_UNITS` (Sunshine) são serviços normais. `FOLLOW_FLATPAKS` (waywallen)
+    serviços. Também reinicia Sunshine, waywallen e Hermes Gateway para detectarem a NVIDIA.
+  - **Seguidores:** `FOLLOW_UNITS` (Sunshine e `hermes-gateway.service`) são serviços normais.
+    `FOLLOW_FLATPAKS` (waywallen)
     rodam num escopo próprio do Flatpak, fora do serviço que os inicia: o hook os identifica pelo
     cgroup e os fecha com `flatpak kill`.
+    O `nvidia-users` reconhece o gateway pelo `MainPID` do serviço, sem ignorar outros processos
+    chamados `hermes` ou `python`. Testes sem trocar a GPU: `python3 vfio/test-follow-units.py -v`.
   - **Limite de inícios:** antes de cada reinício que ele mesmo provoca, o hook roda
     `systemctl reset-failed`. O Sunshine aceita só 5 inícios a cada 8 min 20 s, e ligar e desligar
     a VM algumas vezes seguidas estourava esse limite (o mesmo valia para o `nvidia-powerd`).
@@ -212,6 +223,15 @@ Se qualquer programa ficar com a NVIDIA aberta, a VM não liga. Quatro ajustes c
      no Linux, ou para a Intel, com `FLATPAK_GL_DRIVERS=default`, se estiver na VM. Essa variável
      deixa as bibliotecas da NVIDIA fora da sandbox: a extensão `GL.nvidia` do Flatpak faz o
      renderizador abrir a NVIDIA mesmo com o `render_node` na Intel;
+   - a sandbox só enxerga a NVIDIA pela extensão `org.freedesktop.Platform.GL.nvidia-<versão>` da
+     versão do driver carregado. Se ela não estiver instalada, o `waywallen-gpu` usa a Intel e avisa
+     no journal ("… is not installed, using the Intel iGPU"). Sem isso, o renderizador morria com
+     `no Vulkan device matches render_node`;
+   - essa extensão some sempre que alguma limpeza (`flatpak uninstall --unused`, Discover) roda com
+     a VM ligada: com o módulo `nvidia` descarregado, o Flatpak conclui que ela não é usada
+     (aconteceu em 20/10/2026). Ela não é protegida com `flatpak pin` de propósito, para as versões
+     antigas do driver continuarem saindo sozinhas: o waywallen fica na Intel até o próximo
+     `flatpak update` reinstalá-la (veja [Solução de problemas](#solução-de-problemas));
    - backup da configuração original: `config.toml.bak-20261013`.
 4. **Janela do Looking Glass sem piscar.**
    - O Krohnkite reorganizava a janela quando o foco mudava. A classe `looking-glass-client` entrou
@@ -311,6 +331,11 @@ monitor virtual no Windows.
     é **encerrado**: Ctrl+Alt+Shift+**E** no Moonlight do PC, ou "encerrar" no menu do "Desktop" na
     lista de apps. Ctrl+Alt+Shift+**Q** só desconecta: a sessão e o monitor virtual continuam, e
     reconectar reaproveita os dois;
+  - o `tela-linux.service` do pve (`NMTENGPROD6301`) **encerra** a sessão ao parar: roda o
+    Moonlight com `--quit-after` e, com `KillMode=mixed`, o SIGTERM vai só para um bash que o repassa
+    ao Moonlight. Antes, o SIGTERM no grupo todo derrubava o `cage` junto, o Moonlight caía sem avisar
+    o Sunshine e o monitor virtual ficava. Não dá para usar `ExecStop`: ele também pega o tty8 e o
+    `TTYVHangup` mata tudo com SIGHUP. Backup da unit em `tela-linux.service.bak-20261023`;
   - fora de uma sessão, o Sunshine sobe normalmente sem essa tela e usa uma tela física só para
     testar os codificadores.
 
@@ -353,6 +378,37 @@ monitor virtual no Windows.
   publicado no GitHub), serviço `Deskflow` automático. Ele conecta em `192.168.122.1` com o nome
   `VM23711`. A primeira configuração e o aceite das impressões digitais TLS dos dois lados são
   feitos na interface.
+- **Win+L não bloqueia o Windows pelo Deskflow** (nem Ctrl+Alt+Del): o Winlogon só aceita esses
+  atalhos de um teclado físico e descarta as teclas injetadas com `SendInput`, mesmo com o serviço
+  elevado. Use `bloqueio on` / `bloqueio off` no Linux, que rodam duas tarefas agendadas do Windows
+  pelo `ssh windows`. `bloqueio instalar` compila o helper e cria ou recria as duas:
+  - `LockNow`: `rundll32 user32.dll,LockWorkStation` como `johannes`, na sessão interativa. Rodado
+    direto pelo ssh, ele não faz nada, porque o ssh fica em outra sessão;
+  - `UnlockNow`: `C:\ProgramData\bloqueio\bloqueio-helper.exe unlock` como SYSTEM (fonte em
+    `~/.local/share/bloqueio/bloqueio-helper.cs`, compilada com o `csc` do .NET Framework do próprio
+    Windows). Ele se abre de novo na sessão do console, ainda como SYSTEM, levanta a cortina (relógio)
+    com um espaço e digita a senha do auto login, que o Windows guarda no segredo LSA
+    `DefaultPassword`. A cortina (LockApp) fica na área de trabalho `Default` e o campo de senha
+    (LogonUI) na `Winlogon`; o `SendInput` só funciona numa thread presa à área de trabalho que
+    recebe a entrada, então o helper troca de thread quando a cortina sobe. Se a sessão não estiver
+    bloqueada, não faz nada. Log, sem a senha, em `C:\ProgramData\bloqueio\helper.log`; a pasta só
+    aceita escrita de SYSTEM e Administradores. `bloqueio-helper.exe screenshot`, rodado como SYSTEM
+    (por exemplo pelo `vm-ps.py`), salva a tela atual, mesmo a de bloqueio, em `tela.png` ali.
+  - **Por que não `tsdiscon`/`tscon`:** também desbloqueia sem senha, mas troca a sessão do console,
+    e o serviço do Sunshine reinicia o `sunshine.exe` a cada troca. O Moonlight da terceira tela
+    (`tela windows`) cai junto.
+- **O Windows bloqueia e desbloqueia junto com o KDE:** o serviço de usuário `bloqueio-seguir`
+  (`bloqueio seguir`) ouve o sinal `org.freedesktop.ScreenSaver.ActiveChanged` do kscreenlocker
+  (`gdbus monitor --dest`, que só aceita o sinal do dono do nome). Com a VM ligada (`virsh list`):
+  - o KDE bloqueou: roda `bloqueio on` e deixa a marca `/run/user/1000/bloqueio-seguir`. Se o
+    Windows já estava bloqueado, não deixa a marca;
+  - o KDE desbloqueou: só roda `bloqueio off` se a marca existir. Um Windows bloqueado antes, com
+    `bloqueio on` ou à mão, continua bloqueado.
+
+  O Windows bloqueia uns 1,5 s depois do KDE e desbloqueia uns 3 s depois. Funciona porque o
+  1Password não trava junto com a tela (`security.autolock.onDeviceLock = false`) e o agente dele
+  atende o ssh do serviço sem pedir confirmação. Se ele passar a travar com a tela, o desbloqueio
+  do Windows falha até o 1Password ser destravado.
 
 ### 10. Pacotes
 
@@ -400,6 +456,9 @@ Os arquivos inteiros têm cópia em `vfio/home/`, no mesmo caminho relativo à p
 | `~/.config/sunshine/sunshine.conf` | Captura, placa e `global_prep_cmd` do Sunshine | `vfio/home/…` |
 | `~/.local/bin/sunshine-virtual-monitor` | Cria e remove o monitor virtual a cada sessão do Moonlight | `vfio/home/…` |
 | `~/.local/bin/waywallen-gpu` + `~/.config/systemd/user/app-org.waywallen.waywallen@autostart.service.d/gpu.conf` | waywallen segue a GPU | `vfio/home/…` |
+| `~/.local/bin/tela` + `~/.local/share/vicinae/scripts/tela-{linux,windows,off}.sh` | Terceira tela (monitor do pve): `tela linux`, `tela windows`, `tela off`, `tela` (estado); no Vicinae, "Terceira tela: …" | `vfio/home/…` |
+| `~/.local/bin/bloqueio` + `~/.local/share/bloqueio/bloqueio-helper.cs` + `~/.local/share/vicinae/scripts/bloqueio-{on,off}.sh` | Bloquear e desbloquear a VM: `bloqueio on`, `bloqueio off`, `bloqueio` (estado), `bloqueio instalar` (helper em `C:\ProgramData\bloqueio` e tarefas `LockNow` e `UnlockNow` no Windows); no Vicinae, "Windows: bloquear/desbloquear" | `vfio/home/…` |
+| `~/.config/systemd/user/bloqueio-seguir.service` (ativado em `graphical-session.target`) | Windows bloqueia e desbloqueia junto com o KDE (`bloqueio seguir`) | `vfio/home/…` |
 | `~/.config/kwinrc`, só a chave `[Script-krohnkite] ignoreClass` | Krohnkite ignora o Looking Glass | comando abaixo |
 | `~/.var/app/org.waywallen.waywallen/config/waywallen/config.toml`, só os dois `render_node` | GPU do waywallen | escrito pelo `waywallen-gpu` a cada início |
 | `~/.ssh/config`, só o bloco `Host win11` | Atalho `ssh win11` | veja a seção [SSH](#8-ssh-para-o-windows) |
@@ -412,6 +471,9 @@ Numa instalação nova, ou se algum desses arquivos se perder, rode a partir da 
 ```bash
 cp -a vfio/home/. ~/ && systemctl --user daemon-reload && kbuildsycoca6
 ```
+
+O `bloqueio-seguir.service` precisa ser ativado uma vez (`systemctl --user enable --now
+bloqueio-seguir`), e o lado do Windows do `bloqueio` é recriado com `bloqueio instalar`.
 
 O `kwinrc` guarda muitas outras configurações, então só a chave do Krohnkite é reaplicada. O
 `render_node` do waywallen não precisa de nada: o `waywallen-gpu` o reescreve a cada início. A lista do Krohnkite abaixo é o padrão dele mais
@@ -485,6 +547,18 @@ dos reinícios dele. Se acontecer por outro motivo, rode
 
 **O papel de parede some ou para.** `systemctl --user status app-org.waywallen.waywallen@autostart.service`
 e `sudo ./vfio/test-follow.sh` mostram em que GPU o renderizador está.
+
+**O waywallen ficou na Intel com a VM desligada.** O journal do serviço acima mostra
+"`org.freedesktop.Platform.GL.nvidia-… is not installed`": falta a extensão do Flatpak para o driver
+atual (ela é removida por limpezas com a VM ligada, e cada atualização do driver pede uma nova).
+Instale-a com a NVIDIA no Linux e reinicie o waywallen:
+
+```bash
+flatpak update -y && flatpak kill org.waywallen.waywallen; systemctl --user restart app-org.waywallen.waywallen@autostart.service
+```
+
+Reiniciar só o serviço não basta: o daemon roda em outro cgroup (o escopo do Flatpak), continua
+vivo, e a instância nova sai na hora.
 
 **O Moonlight não conecta no `win11`:**
 - a VM está ligada?

@@ -3,16 +3,22 @@
 #   NVIDIA dGPU on the host (nvidia driver) -> render on it (NVIDIA GL extension in the sandbox)
 #   dGPU with the win11 VM (vfio-pci)       -> Intel iGPU; FLATPAK_GL_DRIVERS=default keeps the
 #                                              NVIDIA libraries out of the sandbox
+# Without the GL.nvidia extension for the loaded driver the sandbox has no NVIDIA Vulkan and the
+# renderer dies ("no Vulkan device matches render_node"), so it falls back to the Intel then.
 # The libvirt hook (vfio-dgpu) kills and restarts waywallen whenever the dGPU changes hands.
 conf=$HOME/.var/app/org.waywallen.waywallen/config/waywallen/config.toml
 
+node=/dev/dri/by-path/pci-0000:00:02.0-render
 d=$(readlink /sys/bus/pci/devices/0000:01:00.0/driver 2>/dev/null)
 if [[ ${d##*/} == nvidia ]]; then
-  node=/dev/dri/by-path/pci-0000:01:00.0-render
-else
-  node=/dev/dri/by-path/pci-0000:00:02.0-render
-  export FLATPAK_GL_DRIVERS=default
+  ext=org.freedesktop.Platform.GL.nvidia-$(tr . - </sys/module/nvidia/version)
+  if flatpak list --runtime --columns=application | grep -qxF "$ext"; then
+    node=/dev/dri/by-path/pci-0000:01:00.0-render
+  else
+    echo "waywallen-gpu: $ext is not installed, using the Intel iGPU" >&2
+  fi
 fi
+[[ $node == *01:00.0* ]] || export FLATPAK_GL_DRIVERS=default
 
 # waywallen rewrites its config while running, so only touch it before it starts
 [[ -f $conf ]] && sed -i "s|^render_node = \".*\"\$|render_node = \"$node\"|" "$conf"

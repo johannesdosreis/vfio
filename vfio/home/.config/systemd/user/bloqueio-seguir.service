@@ -1,0 +1,13 @@
+[Unit]
+Description=VM win11 bloqueia e desbloqueia junto com a tela do KDE (bloqueio seguir)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/bloqueio seguir
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=graphical-session.target

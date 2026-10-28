@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Terceira tela: o monitor do pve (NMTENGPROD6301), que mostra este notebook ou a VM win11 pelo Moonlight.
+#   tela linux   (ou l)   liga mostrando o Linux       (tela-linux.service)
+#   tela windows (ou w)   liga mostrando a VM win11    (tela-windows.service)
+#   tela off              desliga as duas
+#   tela                  diz qual está ligada
+# As duas units têm Conflicts= entre si: ligar uma desliga a outra.
+# A saída vai toda para o stdout, em uma linha: os scripts do Vicinae mostram a primeira linha no HUD.
+set -uo pipefail
+
+pve() { ssh -o BatchMode=yes -o ConnectTimeout=5 pve "$@"; }
+
+ligar() {
+  if pve systemctl restart "$1"; then
+    echo "Terceira tela: $2"
+  else
+    echo "Falha ao ligar $1 no pve"
+    exit 1
+  fi
+}
+
+case ${1:-status} in
+l | linux) ligar tela-linux Linux ;;
+w | win | windows) ligar tela-windows Windows ;;
+off | stop)
+  if pve systemctl stop tela-linux tela-windows; then
+    echo "Terceira tela desligada"
+  else
+    echo "Falha ao desligar a terceira tela no pve"
+    exit 1
+  fi
+  ;;
+status)
+  # is-active sai com 3 quando alguma está parada; 255 é erro do ssh
+  estados=($(pve systemctl is-active tela-linux tela-windows))
+  if [[ $? == 255 ]]; then
+    echo "pve inacessível"
+    exit 1
+  elif [[ ${estados[0]:-} == active ]]; then
+    echo "Terceira tela: Linux"
+  elif [[ ${estados[1]:-} == active ]]; then
+    echo "Terceira tela: Windows"
+  else
+    echo "Terceira tela desligada"
+  fi
+  ;;
+*)
+  echo "uso: tela [linux|windows|off]" >&2
+  exit 2
+  ;;
+esac

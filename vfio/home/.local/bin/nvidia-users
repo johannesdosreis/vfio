@@ -21,11 +21,16 @@ for n in "$dev"/drm/*; do
 done
 pids=$(find /proc/[0-9]*/fd -maxdepth 1 -type l \( "${match[@]}" \) 2>/dev/null | cut -d/ -f3 | sort -un)
 
+# Match the gateway's MainPID, just as the hook does, not every process named hermes/python.
+gateway_systemctl=(systemctl --user)
+[[ $EUID -eq 0 ]] && gateway_systemctl+=(-M johannes@)
+gateway_pid=$("${gateway_systemctl[@]}" show -p MainPID --value hermes-gateway.service 2>/dev/null) || gateway_pid=0
+
 blocking=0
 for pid in $pids; do
   comm=$(cat "/proc/$pid/comm" 2>/dev/null) || continue
   line=$(printf '%7s  %-10s %s' "$pid" "$(ps -o user= -p "$pid")" "$(ps -o args= -p "$pid" | cut -c1-90)")
-  if [[ $comm =~ $handled ]]; then
+  if [[ $comm =~ $handled || $pid == "$gateway_pid" ]]; then
     echo "  ok      $line   (o hook fecha e reabre sozinho)"
   else
     echo "  FECHAR  $line"
